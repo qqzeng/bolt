@@ -21,13 +21,15 @@ type txid uint64
 // them. Pages can not be reclaimed by the writer until no more transactions
 // are using them. A long running read transaction can cause the database to
 // quickly grow.
+// Tx 表示 boltdb 的一个只读事务，或者读写事务。只读事务不能修改数据库状态，即增删改 key、bucket等。
+// 需要注意的长时间的只读事务会导致数据库不断增长，性能下降。
 type Tx struct {
-	writable       bool
-	managed        bool
-	db             *DB
-	meta           *meta
-	root           Bucket
-	pages          map[pgid]*page
+	writable       bool // 是否为写事务
+	managed        bool // 标记该事务被 boltdb 主动管理，而无需用户在 Update 过程中手动调用 commit 或者 rollback 操作。
+	db             *DB // 关联的 db 实例
+	meta           *meta // 元数据需要被复制，因为只读事务需要访问，且读写事务可以修改它。
+	root           Bucket // db 根节点
+	pages          map[pgid]*page // 读写事务的页缓存
 	stats          TxStats
 	commitHandlers []func()
 
@@ -41,24 +43,31 @@ type Tx struct {
 }
 
 // init initializes the transaction.
+// init 初始化事务
 func (tx *Tx) init(db *DB) {
+	// 设置事务关联的 db 实例，
 	tx.db = db
 	tx.pages = nil
 
 	// Copy the meta page since it can be changed by the writer.
+	// 拷贝一份元数据信息，避免读写事务修改数据库元数据而使得读事务受到影响，从而不满足 mvcc
 	tx.meta = &meta{}
 	db.meta().copy(tx.meta)
 
 	// Copy over the root bucket.
+	// 拷贝根 bucket，并从 meta page 中赋值
 	tx.root = newBucket(tx)
 	tx.root.bucket = &bucket{}
 	*tx.root.bucket = tx.meta.root
 
 	// Increment the transaction id and add a page cache for writable transactions.
+	// 若为写事务，则创建页缓存，同时递增事务 ID
 	if tx.writable {
 		tx.pages = make(map[pgid]*page)
 		tx.meta.txid += txid(1)
 	}
+
+	// freelist 页没有被复制，因为，只读事务无需访问 freelist，而读写事务又都是串行执行，因此，freelist 只需全局一份即可。
 }
 
 // ID returns the transaction id.
@@ -141,6 +150,8 @@ func (tx *Tx) OnCommit(fn func()) {
 // Commit writes all changes to disk and updates the meta page.
 // Returns an error if a disk write error occurs, or if Commit is
 // called on a read-only transaction.
+//
+// Commit 将 db 的更新写入到磁盘，同时更新 meta 页。
 func (tx *Tx) Commit() error {
 	_assert(!tx.managed, "managed tx commit not allowed")
 	if tx.db == nil {
@@ -152,6 +163,7 @@ func (tx *Tx) Commit() error {
 	// TODO(benbjohnson): Use vectorized I/O to write out dirty pages.
 
 	// Rebalance nodes which have had deletions.
+	// 执行 Rebalance 过程。
 	var startTime = time.Now()
 	tx.root.rebalance()
 	if tx.stats.Rebalance > 0 {
@@ -159,6 +171,7 @@ func (tx *Tx) Commit() error {
 	}
 
 	// spill data onto dirty pages.
+	// 执行 spill 过程
 	startTime = time.Now()
 	if err := tx.root.spill(); err != nil {
 		tx.rollback()
@@ -167,13 +180,17 @@ func (tx *Tx) Commit() error {
 	tx.stats.SpillTime += time.Since(startTime)
 
 	// Free the old root bucket.
+	// 更新 root bucket
 	tx.meta.root.root = tx.root.root
 
 	opgid := tx.meta.pgid
 
 	// Free the freelist and allocate new pages for it. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
+	// 释放该事务关联的 page
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
+	// 重新分配连续的 page 列表，并将 freelist 页写入新的 page，最后更新 meta 页中保存的 freelist 页的引用
+	// 分配的过程中，会将 page 放入事务关联的页缓存中，以在后续被刷盘
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
 		tx.rollback()
@@ -186,6 +203,8 @@ func (tx *Tx) Commit() error {
 	tx.meta.freelist = p.id
 
 	// If the high water mark has moved up then attempt to grow the database.
+	// 若 meta 页中记录的最大的 page id 已不足，即小于当前的最大的 page id 值。
+	// 则需扩大 db 的大小。
 	if tx.meta.pgid > opgid {
 		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil {
 			tx.rollback()
@@ -194,6 +213,7 @@ func (tx *Tx) Commit() error {
 	}
 
 	// Write dirty pages to disk.
+	// 刷新脏页到磁盘
 	startTime = time.Now()
 	if err := tx.write(); err != nil {
 		tx.rollback()
@@ -202,6 +222,7 @@ func (tx *Tx) Commit() error {
 
 	// If strict mode is enabled then perform a consistency check.
 	// Only the first consistency error is reported in the panic.
+	// 在严格模式下，需要执行一个一致性检验过程。
 	if tx.db.StrictMode {
 		ch := tx.Check()
 		var errs []string
@@ -218,6 +239,7 @@ func (tx *Tx) Commit() error {
 	}
 
 	// Write meta to disk.
+	// 将 meta page 写入磁盘
 	if err := tx.writeMeta(); err != nil {
 		tx.rollback()
 		return err
@@ -225,9 +247,11 @@ func (tx *Tx) Commit() error {
 	tx.stats.WriteTime += time.Since(startTime)
 
 	// Finalize the transaction.
+	// 关闭事务，释放资源
 	tx.close()
 
 	// Execute commit handlers now that the locks have been removed.
+	// 执行 commit hooks
 	for _, fn := range tx.commitHandlers {
 		fn()
 	}
@@ -237,6 +261,8 @@ func (tx *Tx) Commit() error {
 
 // Rollback closes the transaction and ignores all previous updates. Read-only
 // transactions must be rolled back and not committed.
+//
+// Rollback 忽略所有的更新操作，然后关闭事务。其中，只读事务必须 rollback，而不是 commit。
 func (tx *Tx) Rollback() error {
 	_assert(!tx.managed, "managed tx rollback not allowed")
 	if tx.db == nil {
@@ -251,7 +277,9 @@ func (tx *Tx) rollback() {
 		return
 	}
 	if tx.writable {
+		// 读写事务的回滚，需要清空 pending 和 cache 集合
 		tx.db.freelist.rollback(tx.meta.txid)
+		// 恢复 freelist 包含的各个结构
 		tx.db.freelist.reload(tx.db.page(tx.db.meta().freelist))
 	}
 	tx.close()
@@ -268,6 +296,7 @@ func (tx *Tx) close() {
 		var freelistAlloc = tx.db.freelist.size()
 
 		// Remove transaction ref & writer lock.
+		// 释放锁资源
 		tx.db.rwtx = nil
 		tx.db.rwlock.Unlock()
 
@@ -280,6 +309,7 @@ func (tx *Tx) close() {
 		tx.db.stats.TxStats.add(&tx.stats)
 		tx.db.statlock.Unlock()
 	} else {
+		// 移除只读事务
 		tx.db.removeTx(tx)
 	}
 
@@ -471,23 +501,30 @@ func (tx *Tx) allocate(count int) (*page, error) {
 }
 
 // write writes any dirty pages to disk.
+// write 将脏页写回到磁盘，这里的脏页都是事务执行过程中被修改的页。但不包括 meta 页。
 func (tx *Tx) write() error {
 	// Sort pages by id.
+	// 首先将 page 按 page id 排序
 	pages := make(pages, 0, len(tx.pages))
 	for _, p := range tx.pages {
 		pages = append(pages, p)
 	}
 	// Clear out page cache early.
+	// 情况事务关联的 page 缓存
 	tx.pages = make(map[pgid]*page)
 	sort.Sort(pages)
 
 	// Write pages to disk in order.
+	// 将 page 按顺序写入磁盘
 	for _, p := range pages {
+		// 计算第 i 个 page p 的起始写入位置，以及写入的大小，即需要占据的空间。
 		size := (int(p.overflow) + 1) * tx.db.pageSize
 		offset := int64(p.id) * int64(tx.db.pageSize)
 
 		// Write out page in "max allocation" sized chunks.
+		// 将 page 转换为字节序列
 		ptr := (*[maxAllocSize]byte)(unsafe.Pointer(p))
+		// 循环将 page 字节序列写入磁盘，每次最多写入 maxAllocSize 大小。
 		for {
 			// Limit our write to our max allocation size.
 			sz := size
@@ -517,6 +554,7 @@ func (tx *Tx) write() error {
 	}
 
 	// Ignore file sync if flag is set on DB.
+	// 若 db 实例设置了不需要刷盘，则跳过强制刷盘动作。
 	if !tx.db.NoSync || IgnoreNoSync {
 		if err := fdatasync(tx.db); err != nil {
 			return err
@@ -524,9 +562,11 @@ func (tx *Tx) write() error {
 	}
 
 	// Put small pages back to page pool.
+	// 将之前从 page pool 中创建申请的 page 进行回收
 	for _, p := range pages {
 		// Ignore page sizes over 1 page.
 		// These are allocated using make() instead of the page pool.
+		// 对于超过一页大小的 page，其不是使用 page pool 分配，而是使用 make 动态申请的内存
 		if int(p.overflow) != 0 {
 			continue
 		}
@@ -544,6 +584,7 @@ func (tx *Tx) write() error {
 }
 
 // writeMeta writes the meta to the disk.
+// writeMeta 单独将 meta 页写入磁盘，因为 meta 页在写事务中可能已被修改。
 func (tx *Tx) writeMeta() error {
 	// Create a temporary buffer for the meta page.
 	buf := make([]byte, tx.db.pageSize)

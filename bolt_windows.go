@@ -95,7 +95,10 @@ func funlock(db *DB) error {
 
 // mmap memory maps a DB's data file.
 // Based on: https://github.com/edsrzf/mmap-go
+// mmap 将 db 文件从磁盘映射到内存中。具体的数据加载时机由操作系统决定
+// TODO
 func mmap(db *DB, sz int) error {
+	// 若是读写事务，则保证 mmap 到内存的大小正好为数据库文件的大小
 	if !db.readOnly {
 		// Truncate the database to the size of the mmap.
 		if err := db.file.Truncate(int64(sz)); err != nil {
@@ -123,6 +126,7 @@ func mmap(db *DB, sz int) error {
 	}
 
 	// Convert to a byte array.
+	// 将当前 db 数据的内存指向 mmap 出来的内存块，同时更新数据库大小
 	db.data = ((*[maxMapSize]byte)(unsafe.Pointer(addr)))
 	db.datasz = sz
 
